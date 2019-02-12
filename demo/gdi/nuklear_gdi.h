@@ -57,6 +57,78 @@ static struct {
     struct nk_context ctx;
 } gdi;
 
+static void
+nk_create_image(struct nk_image * image, const char * frame_buffer, const int width, const int height)
+{
+    if (image && frame_buffer && (width > 0) && (height > 0))
+    {
+        image->w = width;
+        image->h = height;
+        image->region[0] = 0;
+        image->region[1] = 0;
+        image->region[2] = width;
+        image->region[3] = height;
+        
+        INT row = ((width * 3 + 3) & ~3);
+        BITMAPINFO bi = { 0 };
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = width;
+        bi.bmiHeader.biHeight = height;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 24;
+        bi.bmiHeader.biCompression = BI_RGB;
+        bi.bmiHeader.biSizeImage = row * height;
+        
+        LPBYTE lpBuf, pb = NULL;
+        HBITMAP hbm = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, (void**)&lpBuf, NULL, 0);
+        
+        pb = lpBuf + row * height;
+        unsigned char * src = (unsigned char *)frame_buffer;
+        for (int v = 0; v<height; v++)
+        {
+            pb -= row;
+            for (int i = 0; i < row; i += 3)
+            {
+                pb[i + 0] = src[0];
+                pb[i + 1] = src[1];
+                pb[i + 2] = src[2];
+                src += 3;
+            }
+        }        
+        SetDIBits(NULL, hbm, 0, height, lpBuf, &bi, DIB_RGB_COLORS);
+        image->handle.ptr = hbm;
+    }
+}
+
+static void
+nk_delete_image(struct nk_image * image)
+{
+    if (image && image->handle.id != 0)
+    {
+        HBITMAP hbm = image->handle.ptr;
+        DeleteObject(hbm);
+        memset(image, 0, sizeof(struct nk_image));
+    }
+}
+
+static void
+nk_gdi_draw_image(short x, short y, unsigned short w, unsigned short h,
+    struct nk_image img, struct nk_color col)
+{
+    HBITMAP hbm = img.handle.ptr;
+    HDC     hDCBits;
+    BITMAP  bitmap;
+    
+    if (!gdi.memory_dc || !hbm)
+        return;
+    
+    hDCBits = CreateCompatibleDC(gdi.memory_dc);
+    GetObject(hbm, sizeof(BITMAP), (LPSTR)&bitmap);
+    SelectObject(hDCBits, hbm);
+    StretchBlt(gdi.memory_dc, x, y, w, h, hDCBits, 0, 0, bitmap.bmWidth, bitmap.bmHeight, SRCCOPY);
+    DeleteDC(hDCBits);
+}
+
 static COLORREF
 convert_color(struct nk_color c)
 {
@@ -107,14 +179,15 @@ nk_gdi_stroke_rect(HDC dc, short x, short y, unsigned short w,
         SelectObject(dc, pen);
     }
 
-    SetDCBrushColor(dc, OPAQUE);
+    HGDIOBJ br = SelectObject(dc, GetStockObject(NULL_BRUSH));
     if (r == 0) {
         Rectangle(dc, x, y, x + w, y + h);
     } else {
         RoundRect(dc, x, y, x + w, y + h, r, r);
     }
+    SelectObject(dc, br);
 
-    if (pen) {
+    if (pen) { 
         SelectObject(dc, GetStockObject(DC_PEN));
         DeleteObject(pen);
     }
@@ -135,6 +208,58 @@ nk_gdi_fill_rect(HDC dc, short x, short y, unsigned short w,
         SetDCBrushColor(dc, color);
         RoundRect(dc, x, y, x + w, y + h, r, r);
     }
+}
+static void
+nk_gdi_set_vertexColor(PTRIVERTEX tri, struct nk_color col)
+{
+    tri->Red   = col.r << 8;
+    tri->Green = col.g << 8;
+    tri->Blue  = col.b << 8;
+    tri->Alpha = 0xff << 8;
+}
+
+static void
+nk_gdi_rect_multi_color(HDC dc, short x, short y, unsigned short w,
+    unsigned short h, struct nk_color left, struct nk_color top,
+    struct nk_color right, struct nk_color bottom)
+{
+    BLENDFUNCTION alphaFunction;
+    GRADIENT_RECT gRect;
+    GRADIENT_TRIANGLE gTri[2];
+    TRIVERTEX vt[4];
+    alphaFunction.BlendOp = AC_SRC_OVER;
+    alphaFunction.BlendFlags = 0;
+    alphaFunction.SourceConstantAlpha = 0;
+    alphaFunction.AlphaFormat = AC_SRC_ALPHA;
+
+    /* TODO: This Case Needs Repair.*/
+    /* Top Left Corner */
+    vt[0].x     = x;
+    vt[0].y     = y;
+    nk_gdi_set_vertexColor(&vt[0], left);
+    /* Top Right Corner */
+    vt[1].x     = x+w;
+    vt[1].y     = y;
+    nk_gdi_set_vertexColor(&vt[1], top);
+    /* Bottom Left Corner */
+    vt[2].x     = x;
+    vt[2].y     = y+h;
+    nk_gdi_set_vertexColor(&vt[2], right);
+
+    /* Bottom Right Corner */
+    vt[3].x     = x+w;
+    vt[3].y     = y+h;
+    nk_gdi_set_vertexColor(&vt[3], bottom);
+
+    gTri[0].Vertex1 = 0;
+    gTri[0].Vertex2 = 1;
+    gTri[0].Vertex3 = 2;
+    gTri[1].Vertex1 = 2;
+    gTri[1].Vertex2 = 1;
+    gTri[1].Vertex3 = 3;
+    GdiGradientFill(dc, vt, 4, gTri, 2 , GRADIENT_FILL_TRIANGLE);
+    AlphaBlend(gdi.window_dc,  x, y, x+w, y+h,gdi.memory_dc, x, y, x+w, y+h,alphaFunction);
+
 }
 
 static void
@@ -347,6 +472,7 @@ static void
 nk_gdi_blit(HDC dc)
 {
     BitBlt(dc, 0, 0, gdi.width, gdi.height, gdi.memory_dc, 0, 0, SRCCOPY);
+
 }
 
 GdiFont*
@@ -392,7 +518,7 @@ nk_gdifont_del(GdiFont *font)
 }
 
 static void
-nk_gdi_clipbard_paste(nk_handle usr, struct nk_text_edit *edit)
+nk_gdi_clipboard_paste(nk_handle usr, struct nk_text_edit *edit)
 {
     (void)usr;
     if (IsClipboardFormatAvailable(CF_UNICODETEXT) && OpenClipboard(NULL))
@@ -426,7 +552,7 @@ nk_gdi_clipbard_paste(nk_handle usr, struct nk_text_edit *edit)
 }
 
 static void
-nk_gdi_clipbard_copy(nk_handle usr, const char *text, int len)
+nk_gdi_clipboard_copy(nk_handle usr, const char *text, int len)
 {
     if (OpenClipboard(NULL))
     {
@@ -467,8 +593,8 @@ nk_gdi_init(GdiFont *gdifont, HDC window_dc, unsigned int width, unsigned int he
     SelectObject(gdi.memory_dc, gdi.bitmap);
 
     nk_init_default(&gdi.ctx, font);
-    gdi.ctx.clip.copy = nk_gdi_clipbard_copy;
-    gdi.ctx.clip.paste = nk_gdi_clipbard_paste;
+    gdi.ctx.clip.copy = nk_gdi_clipboard_copy;
+    gdi.ctx.clip.paste = nk_gdi_clipboard_paste;
     return &gdi.ctx;
 }
 
@@ -490,7 +616,7 @@ nk_gdi_handle_event(HWND wnd, UINT msg, WPARAM wparam, LPARAM lparam)
     case WM_SIZE:
     {
         unsigned width = LOWORD(lparam);
-        unsigned height = LOWORD(lparam);
+        unsigned height = HIWORD(lparam);
         if (width != gdi.width || height != gdi.height)
         {
             DeleteObject(gdi.bitmap);
@@ -627,6 +753,7 @@ nk_gdi_handle_event(HWND wnd, UINT msg, WPARAM wparam, LPARAM lparam)
         return 1;
 
     case WM_LBUTTONUP:
+        nk_input_button(&gdi.ctx, NK_BUTTON_DOUBLE, (short)LOWORD(lparam), (short)HIWORD(lparam), 0);
         nk_input_button(&gdi.ctx, NK_BUTTON_LEFT, (short)LOWORD(lparam), (short)HIWORD(lparam), 0);
         ReleaseCapture();
         return 1;
@@ -657,6 +784,10 @@ nk_gdi_handle_event(HWND wnd, UINT msg, WPARAM wparam, LPARAM lparam)
 
     case WM_MOUSEMOVE:
         nk_input_motion(&gdi.ctx, (short)LOWORD(lparam), (short)HIWORD(lparam));
+        return 1;
+
+    case WM_LBUTTONDBLCLK:
+        nk_input_button(&gdi.ctx, NK_BUTTON_DOUBLE, (short)LOWORD(lparam), (short)HIWORD(lparam), 1);
         return 1;
     }
 
@@ -746,8 +877,14 @@ nk_gdi_render(struct nk_color clear)
             nk_gdi_stroke_curve(memory_dc, q->begin, q->ctrl[0], q->ctrl[1],
                 q->end, q->line_thickness, q->color);
         } break;
-        case NK_COMMAND_RECT_MULTI_COLOR:
-        case NK_COMMAND_IMAGE:
+        case NK_COMMAND_RECT_MULTI_COLOR: {
+            const struct nk_command_rect_multi_color *r = (const struct nk_command_rect_multi_color *)cmd;
+            nk_gdi_rect_multi_color(memory_dc, r->x, r->y,r->w, r->h, r->left, r->top, r->right, r->bottom);
+        } break;
+        case NK_COMMAND_IMAGE: {
+            const struct nk_command_image *i = (const struct nk_command_image *)cmd;
+            nk_gdi_draw_image(i->x, i->y, i->w, i->h, i->img, i->col);
+        } break;
         case NK_COMMAND_ARC:
         case NK_COMMAND_ARC_FILLED:
         default: break;
